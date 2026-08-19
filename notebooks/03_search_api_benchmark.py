@@ -17,6 +17,7 @@
 import _setup  # noqa: F401
 import statistics
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -31,30 +32,45 @@ import httpx
 # %%
 ROOT = Path(_setup.__file__).resolve().parent.parent
 proc = subprocess.Popen(
-    ["uvicorn", "app.main:app", "--port", "8000", "--log-level", "warning"],
+    [sys.executable, "-m", "uvicorn", "app.main:app", "--port", "8123", "--log-level", "warning"],
     cwd=str(ROOT),
+    stdout=subprocess.PIPE,
+    stderr=subprocess.STDOUT,
+    text=True,
 )
 
 # Đợi server up + warm (Searcher.from_corpus loads embeddings + indexes 1000 docs)
-URL = "http://localhost:8000"
-for _ in range(60):
+URL = "http://localhost:8123"
+for _ in range(180):
+    if proc.poll() is not None:
+        startup_log = proc.stdout.read() if proc.stdout else "(no server log)"
+        raise RuntimeError(
+            f"API process exited with code {proc.returncode}.\n{startup_log}"
+        )
     try:
-        r = httpx.get(f"{URL}/healthz", timeout=2.0)
+        r = httpx.get(f"{URL}/healthz", timeout=2.0, trust_env=False)
         if r.status_code == 200 and r.json().get("ready"):
             break
     except httpx.HTTPError:
         pass
     time.sleep(1)
 else:
-    raise RuntimeError("API didn't become ready within 60s")
+    proc.terminate()
+    proc.wait(timeout=5)
+    startup_log = proc.stdout.read() if proc.stdout else "(no server log)"
+    raise RuntimeError(f"API didn't become ready within 180s.\n{startup_log}")
 
-print(httpx.get(f"{URL}/healthz").json())
+print(httpx.get(f"{URL}/healthz", trust_env=False).json())
 
 # %% [markdown]
 # ## 2. Single query — kiểm tra response shape
 
 # %%
-r = httpx.get(f"{URL}/search", params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"})
+r = httpx.get(
+    f"{URL}/search",
+    params={"q": "cloud computing tự động mở rộng", "mode": "hybrid"},
+    trust_env=False,
+)
 r.raise_for_status()
 body = r.json()
 print(f"latency_ms: {body['latency_ms']:.1f}")
@@ -85,13 +101,18 @@ def percentile(values: list[float], p: float) -> float:
     return sorted(values)[min(int(n * p), n - 1)]
 
 
-def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
+def benchmark_mode(
+    mode: str,
+    client: httpx.Client,
+    reps: int = 2,
+) -> dict[str, float]:
     server_latencies: list[float] = []
     wall_latencies: list[float] = []
     for _ in range(reps):
         for q in golden:
             t0 = time.perf_counter()
-            r = httpx.get(f"{URL}/search", params={"q": q["query"], "mode": mode})
+            r = client.get("/search", params={"q": q["query"], "mode": mode})
+            r.raise_for_status()
             wall_latencies.append((time.perf_counter() - t0) * 1000)
             server_latencies.append(r.json()["latency_ms"])
     return {
@@ -104,11 +125,13 @@ def benchmark_mode(mode: str, reps: int = 2) -> dict[str, float]:
 
 print(f"  {'mode':10}  {'P50':>7}  {'P95':>7}  {'P99':>7}  {'P99(wall)':>9}")
 results = {}
-for mode in ("keyword", "semantic", "hybrid"):
-    res = benchmark_mode(mode)
-    results[mode] = res
-    print(f"  {mode:10}  {res['p50_server']:>5.1f}ms  {res['p95_server']:>5.1f}ms  "
-          f"{res['p99_server']:>5.1f}ms  {res['p99_wall']:>7.1f}ms")
+with httpx.Client(base_url=URL, timeout=60.0, trust_env=False) as client:
+    for mode in ("keyword", "semantic", "hybrid"):
+        print(f"  Running {mode:8}...", end="", flush=True)
+        res = benchmark_mode(mode, client)
+        results[mode] = res
+        print(f" P50={res['p50_server']:.1f}ms  P95={res['p95_server']:.1f}ms  "
+              f"P99={res['p99_server']:.1f}ms  P99(wall)={res['p99_wall']:.1f}ms")
 
 # %% [markdown]
 # ## 4. Rubric assertion — hybrid P99 server-side < 50ms
